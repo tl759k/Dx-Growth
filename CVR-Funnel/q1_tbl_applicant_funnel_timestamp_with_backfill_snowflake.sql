@@ -177,6 +177,17 @@ where 1=1
 group by 1
 )
 
+, tbl_bgc_submit_intl as (
+select 
+  unique_link 
+  , convert_timezone('UTC', 'America/Los_Angeles', min(timestamp)) as bgc_submit_intl 
+from 
+  segment_events_raw.driver_production.workflow_step_submit_success 
+where 1=1
+  and page_id = 'BACKGROUND_CHECK_STATUS'
+group by 1
+)
+
 , tbl_account_activation as (
 select 
   unique_link 
@@ -197,22 +208,91 @@ where 1=1
 group by all
 )
 
--- heatmap busyness
-, tbl_heatmap_busyness as (
+-- old method: heatmap busyness
+-- , tbl_heatmap_busyness_pre_monarch as (
+-- select
+--   a.dasher_id
+--   , min(convert_timezone('UTC', 'America/Los_Angeles', a.timestamp)) first_impression_time
+--   , count(case when lower(sp_busyness) in ('busy', 'very_busy') then sp_busyness end) busy_impression_freq -- not_busy, very_busy, busy, normal, full, unknown
+--   , count(case when lower(sp_busyness) in ('very_busy') then sp_busyness end) very_busy_impression_freq
+--   , count(sp_busyness) total_impression_freq
+--   , min_by(lower(sp_busyness), a.timestamp) as first_impression_busyness
+-- from segment_events_raw.driver_production.m_home_heatmap_loaded a
+-- left join edw.dasher.dimension_dasher_applicants dda on a.dasher_id = dda.dasher_id
+-- left join tbl_account_activation b on b.unique_link = dda.unique_link
+-- where 1=1
+--   and convert_timezone('UTC', 'America/Los_Angeles', a.timestamp) >= b.account_activation
+-- group by all
+-- )
+
+-- -- monarch heatmap impression
+-- , tbl_heatmap_impression_mornach as (
+-- select 
+--   a.user_id as dasher_id -- dasher_id
+--   , convert_timezone('UTC', 'America/Los_Angeles', min(a.timestamp)) first_impression_time 
+-- from iguazu.driver.user_operation_span_tracing as a
+-- left join edw.dasher.dimension_dasher_applicants as dda on trim(a.user_id) = trim(dda.dasher_id)
+-- where 1=1
+--   and convert_timezone('UTC', 'America/Los_Angeles', a.timestamp) >= convert_timezone('UTC', 'America/Los_Angeles', dda.oriented_at_datetime)
+--   and a.context = 'home_screen'
+--   and a.category = 'ui_load'
+-- group by all
+-- )
+
+-- , tbl_heatmap_busyness as (
+-- select
+--     a.dasher_id
+--     , coalesce(a.first_impression_time, b.first_impression_time) as first_impression_time
+--     , a.busy_impression_freq
+--     , a.very_busy_impression_freq
+--     , a.total_impression_freq
+--     , a.first_impression_busyness
+-- from tbl_heatmap_busyness_pre_monarch a
+-- left join tbl_heatmap_impression_mornach b on trim(a.dasher_id) = trim(b.dasher_id)
+-- )
+
+, tbl_heatmap_busyness_prep as (
 select
   a.dasher_id
-  , min(convert_timezone('UTC', 'America/Los_Angeles', a.timestamp)) first_impression_time
-  , count(case when lower(sp_busyness) in ('busy', 'very_busy') then sp_busyness end) busy_impression_freq -- not_busy, very_busy, busy, normal, full, unknown
-  , count(case when lower(sp_busyness) in ('very_busy') then sp_busyness end) very_busy_impression_freq
-  , count(sp_busyness) total_impression_freq
-  , min_by(lower(sp_busyness), a.timestamp) as first_impression_busyness
+  , convert_timezone('UTC', 'America/Los_Angeles', min(a.received_at)) as first_impression_time
+  , min_by(lower(sp_busyness), a.received_at) as first_impression_busyness
+  , count(case when lower(sp_busyness) in ('busy', 'very_busy') then received_at end) as busy_impression_freq
+  , count(received_at) as total_impression_freq
 from segment_events_raw.driver_production.m_home_heatmap_loaded a
-left join edw.dasher.dimension_dasher_applicants dda on a.dasher_id = dda.dasher_id
-left join tbl_account_activation b on b.unique_link = dda.unique_link
+left join edw.dasher.dimension_dasher_applicants as dda on trim(a.user_id) = trim(dda.dasher_id)
 where 1=1
-  and convert_timezone('UTC', 'America/Los_Angeles', a.timestamp) >= b.account_activation
+  and convert_timezone('UTC', 'America/Los_Angeles', a.received_at) >= convert_timezone('UTC', 'America/Los_Angeles', dda.oriented_at_datetime)
+group by all
+
+union all
+
+select
+  a.dasher_id
+  , convert_timezone('UTC', 'America/Los_Angeles', min(a.impression_timestamp_utc)) as first_impression_time
+  , min_by(lower(sp_busyness), a.impression_timestamp_utc) as first_impression_busyness
+  , count(case when lower(sp_busyness) in ('busy', 'very_busy') then impression_timestamp_utc end) as busy_impression_freq
+  , count(impression_timestamp_utc) as total_impression_freq
+from edw.dasher.fact_dasher_access_impressions a
+left join edw.dasher.dimension_dasher_applicants as dda on trim(a.dasher_id) = trim(dda.dasher_id)
+where 1=1
+  and convert_timezone('UTC', 'America/Los_Angeles', a.impression_timestamp_utc) >= convert_timezone('UTC', 'America/Los_Angeles', dda.oriented_at_datetime)
+  and data_version_identifier = 'MONARCH'
 group by all
 )
+
+, tbl_heatmap_busyness as (
+select
+  dasher_id
+  , min(first_impression_time) as first_impression_time
+  , min_by(lower(first_impression_busyness), first_impression_time) as first_impression_busyness
+  , sum(busy_impression_freq) as busy_impression_freq
+  , sum(total_impression_freq) as total_impression_freq
+  , case when sum(busy_impression_freq) > 0 then 'has_busy_impression' else 'no_busy_impression' end as has_busy_impression
+  , case when first_impression_busyness in ('busy', 'very_busy') then 'busy' else 'not_busy' end as first_impression_busyness_bucket
+from tbl_heatmap_busyness_prep
+group by all
+)
+
 
 , all_steps_timestamps as (
 select
@@ -234,10 +314,13 @@ select
   , pers.max_updated_at as idv_approve
   , bgcr.bgc_form_rendered
   , bgcs.bgc_submit
+  , bgcs_intl.bgc_submit_intl
   , aa.account_activation
   , hm.first_impression_time
   , hm.busy_impression_freq -- not_busy, very_busy, busy, normal, full, unknown
-  , hm.very_busy_impression_freq
+  -- , hm.very_busy_impression_freq
+  , hm.has_busy_impression
+  , hm.first_impression_busyness_bucket
   , hm.total_impression_freq
   , hm.first_impression_busyness
   , fs.first_shift_creation
@@ -269,6 +352,7 @@ left join tbl_idv_submit idvsu on idvsu.unique_link = dda.unique_link
 left join persona_status pers on pers.unique_link = dda.unique_link and pers.max_status = 'approved'
 left join tbl_bgc_form_rendered bgcr on bgcr.unique_link = dda.unique_link
 left join tbl_bgc_submit bgcs on bgcs.unique_link = dda.unique_link
+left join tbl_bgc_submit_intl bgcs_intl on bgcs_intl.unique_link = dda.unique_link
 left join tbl_account_activation aa on aa.unique_link = dda.unique_link
 left join tbl_heatmap_busyness hm on hm.dasher_id = dda.dasher_id
 left join tbl_start_first_shift fs on fs.dasher_id = dda.dasher_id
@@ -460,6 +544,7 @@ select
   , a.idv_approve as idv_approve_raw
   , a.bgc_form_rendered as bgc_form_rendered_raw
   , a.bgc_submit as bgc_submit_raw
+  , a.bgc_submit_intl as bgc_submit_intl_raw
   , a.account_activation as account_activation_raw
   , b.*
   , case when account_activation is null and first_dash_date is not null then dateadd('min',  -account_acctivation_to_first_dash, first_dash_date) 
@@ -473,7 +558,7 @@ select
   , a.idv_selfie_upload
   , a.first_impression_time
   , a.busy_impression_freq -- not_busy, very_busy, busy, normal, full, unknown
-  , a.very_busy_impression_freq
+  -- , a.very_busy_impression_freq
   , a.total_impression_freq
   , a.first_impression_busyness
   , a.first_shift_creation
@@ -488,13 +573,15 @@ select
   *
   , case when bgc_submit_raw is null and account_activation is not null then dateadd('min',  -bgc_submit_to_account_acctivation, account_activation) 
       else bgc_submit_raw end as bgc_submit
+  , case when bgc_submit_intl_raw is null and account_activation is not null then dateadd('min',  -bgc_submit_to_account_acctivation, account_activation) 
+      else bgc_submit_raw end as bgc_submit_intl
 from backfill_account_activation
 )
 
 , backfill_bgc_form_rendered as (
 select 
   *
-  , case when bgc_form_rendered_raw is null and bgc_submit is not null then dateadd('min',  -bgc_form_rendered_to_bgc_submit, bgc_submit) 
+  , case when bgc_form_rendered_raw is null and (bgc_submit is not null or bgc_submit_intl is not null) then dateadd('min',  -bgc_form_rendered_to_bgc_submit, coalesce(bgc_submit, bgc_submit_intl)) 
         else bgc_form_rendered_raw end as bgc_form_rendered
 from backfill_bgc_submit
 )
@@ -579,11 +666,12 @@ select
   , idv_approve
   , bgc_form_rendered
   , bgc_submit
+  , bgc_submit_intl
   , account_activation
   -- non backfilled
   , first_impression_time
   , busy_impression_freq -- not_busy, very_busy, busy, normal, full, unknown
-  , very_busy_impression_freq
+  -- , very_busy_impression_freq
   , total_impression_freq
   , first_impression_busyness
   , first_shift_creation
@@ -601,6 +689,7 @@ select
   , idv_approve_raw
   , bgc_form_rendered_raw
   , bgc_submit_raw
+  , bgc_submit_intl_raw
   , account_activation_raw
   , case 
       when (applied_date_raw is null and applied_date is not null)
@@ -612,12 +701,16 @@ select
         or (idv_approve_raw is null and idv_approve is not null)
         or (bgc_form_rendered_raw is null and bgc_form_rendered is not null)
         or (bgc_submit_raw is null and bgc_submit is not null)
+        or (bgc_submit_intl_raw is null and bgc_submit_intl is not null)
         or (account_activation_raw is null and account_activation is not null)
       then 1 else 0 end as backfilled
 from backfill_applied_date
 )
 
-select * from finnal_backfill
+select 
+  current_timestamp as last_updated_at
+  , * 
+from finnal_backfill
 ;
 
 grant select on proddb.static.tbl_applicant_funnel_timestamp_with_backfill_snowflake to public
